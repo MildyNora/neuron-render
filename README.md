@@ -192,6 +192,9 @@ appear as lists in the inspector and can be driven from scripts; `frame` scrubs 
 `NeuronDemoUI` adds an on-screen panel for all of that (Tab hides it, Space plays the animation). The scene
 coordinates are Blender's (Z up): a Unity position (x, y, z) is Blender (x, z, y).
 
+`demo/unity_stage.mp4` (on the release) is the runtime recorded headlessly: the animation through the camera
+component, a camera move of its own, then lights and materials changed live (`demo/make_unity_video.py`).
+
 Checked against the Python renderer on the same frames, same inputs: the Unity port agrees to 57-61 dB on
 `stage` (reference frame, an animated frame, an edited state, and through the camera component) and 77 dB on
 `mori`; what remains is rasterizer edge rounding. It is slower than the Metal path for now: at 960x540,
