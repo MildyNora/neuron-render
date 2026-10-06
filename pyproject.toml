@@ -1,0 +1,19 @@
+[project]
+name = "neuron-render"
+version = "0.1.0"
+description = "A neural approximation of Blender's Cycles: fit a .blend once, then render it in milliseconds."
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6", "numpy", "pillow"]
+
+[project.scripts]
+neuron-render = "neuron_render.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["neuron_render*"]
+
+[tool.setuptools.package-data]
+neuron_render = ["native/*.c", "bl/*.py"]

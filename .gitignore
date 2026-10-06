@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.DS_Store
+# fitted bundles (hundreds of MB to GB each): regenerate with `neuron-render fit`
+scenes/*.neuron/
+# videos: attached to the GitHub release instead; rebuild with the scripts in demo/
+demo/*.mp4
+*.dylib
