@@ -5,6 +5,13 @@ teach a small network what the scene looks like, and from then on renders frames
 dial that trades speed against quality. One fit can cover a frozen scene seen from any angle, or the
 file's whole animation with its lights and materials left adjustable.
 
+![one fit of stage.blend: the 120-frame animation beside Blender, then the lights and materials changed live](demo/stage_parametric.gif)
+
+*The 120-frame animation rendered by Blender (13 min 56 s) and by the fit (10.9 s), then its lights and
+materials changed live. Full video: [stage_parametric.mp4](https://github.com/MildyNora/neuron-render/releases/download/v0.1.0/stage_parametric.mp4);
+the deforming-mesh scene: [ripple_parametric.mp4](https://github.com/MildyNora/neuron-render/releases/download/v0.1.0/ripple_parametric.mp4);
+the four static scenes racing Blender: [scenes_compare.mp4](https://github.com/MildyNora/neuron-render/releases/download/v0.1.0/scenes_compare.mp4).*
+
 ```
 uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -e .
 
