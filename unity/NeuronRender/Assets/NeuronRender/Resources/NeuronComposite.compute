@@ -1,0 +1,57 @@
+// Per pixel: filter-weighted shading groups -> scene-linear radiance -> Blender's view transform (the baked LUT).
+#pragma use_dxc
+#pragma kernel Composite
+
+StructuredBuffer<float> _Rad;
+StructuredBuffer<int> _PxRef;
+StructuredBuffer<int> _EGroup;
+StructuredBuffer<float> _EW;
+StructuredBuffer<float> _PxMiss;
+StructuredBuffer<uint> _Lut;           // halves
+StructuredBuffer<float> _Rcfg;         // [0] eps, [1] 1/scale, [2..4] sky, [5] lut N, [6] vmax, [7] a, [8] dither, [9] linear, [10] groups, [11..] weights
+RWTexture2D<float4> _Out;
+int _W, _H, _FlipOut;
+
+float H16(uint i) { uint w = _Lut[i >> 1]; return f16tof32((i & 1u) != 0u ? (w >> 16) : (w & 0xffffu)); }
+
+float3 nr_pixel(uint p) {
+    int ref = _PxRef[p];
+    int n = ref & 31; uint e0 = uint(ref >> 5);
+    int G = int(_Rcfg[10]);
+    float3 acc = float3(_Rcfg[2], _Rcfg[3], _Rcfg[4]) * _PxMiss[p];
+    for (int k = 0; k < n; k++) {
+        uint g = uint(_EGroup[e0 + uint(k)]) * uint(3 * G);
+        float3 sum = 0.0;
+        for (int q = 0; q < G; q++) {
+            uint b = g + uint(3 * q);
+            float3 y = float3(_Rad[b], _Rad[b + 1u], _Rad[b + 2u]);
+            sum += float3(_Rcfg[11 + 3 * q], _Rcfg[12 + 3 * q], _Rcfg[13 + 3 * q]) * max(exp(y) - _Rcfg[0], 0.0);
+        }
+        acc += _EW[e0 + uint(k)] * sum * _Rcfg[1];
+    }
+    return acc;
+}
+
+float3 nr_display(float3 lin) {
+    int N = int(_Rcfg[5]); float vmax = _Rcfg[6], a = _Rcfg[7];
+    float3 u = log(clamp(lin, 0.0, vmax) / a + 1.0) / log(vmax / a + 1.0) * float(N - 1);
+    float3 fl = clamp(floor(u), 0.0, float(N - 2));
+    float3 fr = u - fl; int3 i0 = int3(fl);
+    float3 acc = 0.0;
+    for (int k = 0; k < 8; k++) {
+        int3 dd = int3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+        float w = (dd.x != 0 ? fr.x : 1.0 - fr.x) * (dd.y != 0 ? fr.y : 1.0 - fr.y) * (dd.z != 0 ? fr.z : 1.0 - fr.z);
+        uint e = uint(((i0.x + dd.x) * N + (i0.y + dd.y)) * N + (i0.z + dd.z)) * 3u;
+        acc += w * float3(H16(e), H16(e + 1u), H16(e + 2u));
+    }
+    return acc;
+}
+
+[numthreads(8, 8, 1)]
+void Composite(uint3 id : SV_DispatchThreadID) {
+    if (int(id.x) >= _W || int(id.y) >= _H) return;
+    uint p = id.y * uint(_W) + id.x;
+    float3 lin = nr_pixel(p);
+    float3 c = _Rcfg[9] > 0.5 ? lin : nr_display(lin);
+    _Out[int2(int(id.x), _FlipOut != 0 ? _H - 1 - int(id.y) : int(id.y))] = float4(c, 1.0);
+}

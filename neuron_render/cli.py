@@ -246,6 +246,14 @@ def cmd_bench(args):
                                            '   %.1f dB' % acc['psnr'] if acc else ''))
 
 
+def cmd_export(args):
+    from .export import export
+    bundle = _bundle(args)
+    if not os.path.exists(os.path.join(bundle, 'model.pt')):
+        sys.exit('nothing fitted at %s' % bundle)
+    export(bundle, args.output or os.path.splitext(bundle)[0] + '.nrpack')
+
+
 def cmd_info(args):
     bundle = _bundle(args)
     path = os.path.join(bundle, 'fit.json')
@@ -330,6 +338,11 @@ def main(argv=None):
     p.add_argument('--frames', type=int, default=30)
     p.add_argument('--gpu', action='store_true', help='also time Blender with Cycles on the GPU')
     p.set_defaults(fn=cmd_bench)
+
+    p = sub.add_parser('export', help='write a fitted scene as a portable pack (for the Unity runtime in unity/)')
+    common(p, quality=False)
+    p.add_argument('-o', '--output', help='pack directory (default: <bundle>.nrpack)')
+    p.set_defaults(fn=cmd_export)
 
     p = sub.add_parser('info', help='what was fitted and how accurate it is')
     common(p, quality=False)

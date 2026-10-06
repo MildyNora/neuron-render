@@ -1,0 +1,123 @@
+// Visibility samples -> shading groups (one per distinct triangle per pixel block, like MSAA) and, per pixel,
+// the (group, filter weight) entries that rebuild it. Port of nr_resolve in native/raster.c.
+#pragma use_dxc
+#pragma kernel Clear
+#pragma kernel Groups
+#pragma kernel Args
+
+#define MAX_BLOCK 64
+
+Texture2D<float> _IdTex;               // triangle id per visibility sample as a float, -1 = nothing
+StructuredBuffer<float> _SubW;         // S*S filter weights inside a pixel
+StructuredBuffer<int> _Cap;            // per triangle (+ sky): 1 = always one group per pixel
+RWStructuredBuffer<uint> _Counters;
+RWStructuredBuffer<int> _GTri;
+RWStructuredBuffer<float> _GDir;
+RWStructuredBuffer<int> _PxRef;
+RWStructuredBuffer<int> _EGroup;
+RWStructuredBuffer<float> _EW;
+RWStructuredBuffer<float> _PxMiss;
+RWStructuredBuffer<uint> _Args;
+int _W, _H, _S, _R, _Full, _SkyId, _FlipId, _Offset, _Chunk, _Group, _ArgsX;
+float3 _CamRight, _CamUp, _CamFwd;
+float _Fx, _Fy, _Cx, _Cy;
+
+#define ReadId(px, py) int(round(_IdTex.Load(int3((px), _FlipId != 0 ? _H * _S - 1 - (py) : (py), 0))))
+
+[numthreads(1, 1, 1)]
+void Clear(uint3 id : SV_DispatchThreadID) { _Counters[0] = 0u; _Counters[1] = 0u; }
+
+[numthreads(8, 8, 1)]
+void Groups(uint3 id : SV_DispatchThreadID) {
+    int bxi = int(id.x), by = int(id.y);
+    if (bxi * _R >= _W || by * _R >= _H) return;
+    int S = _S, R = _R, S2 = S * S;
+    float inv_s = 1.0 / float(S);
+    int bid[MAX_BLOCK], bpix[MAX_BLOCK];
+    float bw[MAX_BLOCK], bx[MAX_BLOCK], byy[MAX_BLOCK];
+    int nb = 0, last = 0;
+    int y_end = min((by + 1) * R, _H), x_end = min((bxi + 1) * R, _W);
+    // first pass: groups and per-pixel entries, kept in a small local list, then written out contiguously
+    int pxg[MAX_BLOCK * 16]; float pxw[MAX_BLOCK * 16]; int pxn[MAX_BLOCK]; float pxmiss[MAX_BLOCK];
+    int npix = 0, ne_total = 0;
+    for (int y = by * R; y < y_end; y++) {
+        for (int x = bxi * R; x < x_end; x++) {
+            int pg[16], np = 0;
+            float pw[16], miss = 0.0;
+            int sameId = _Full == 0 ? 1 : 0;
+            int id0 = ReadId(x * S, y * S);
+            for (int sy = 0; sameId != 0 && sy < S; sy++)
+                for (int sx = 0; sx < S; sx++)
+                    if (ReadId(x * S + sx, y * S + sy) != id0) { sameId = 0; break; }
+            int pix = y * _W + x;
+            if (sameId != 0) {
+                int tid = id0;
+                if (tid < 0 && _SkyId >= 0) tid = _SkyId;
+                if (tid < 0) miss = 1.0;
+                else {
+                    int owner = _Cap[tid] != 0 ? pix : -1;
+                    int g = -1;
+                    if (nb > 0 && bid[last] == tid && bpix[last] == owner) g = last;
+                    else for (int k = 0; k < nb; k++) if (bid[k] == tid && bpix[k] == owner) { g = k; break; }
+                    if (g < 0) { g = nb++; bid[g] = tid; bpix[g] = owner; bw[g] = 0.0; bx[g] = 0.0; byy[g] = 0.0; }
+                    last = g;
+                    bw[g] += 1.0; bx[g] += x + 0.5; byy[g] += y + 0.5;
+                    pg[0] = g; pw[0] = 1.0; np = 1;
+                }
+            } else {
+                for (int sy = 0; sy < S; sy++) {
+                    for (int sx = 0; sx < S; sx++) {
+                        int tid = ReadId(x * S + sx, y * S + sy);
+                        float w = _SubW[sy * S + sx];
+                        if (tid < 0) {
+                            if (_SkyId < 0) { miss += w; continue; }
+                            tid = _SkyId;
+                        }
+                        int owner = _Cap[tid] != 0 ? pix : -1;
+                        int g = -1;
+                        if (_Full == 0) {
+                            if (nb > 0 && bid[last] == tid && bpix[last] == owner) g = last;
+                            else for (int k = 0; k < nb; k++) if (bid[k] == tid && bpix[k] == owner) { g = k; break; }
+                        }
+                        if (g < 0) { g = nb++; bid[g] = tid; bpix[g] = owner; bw[g] = 0.0; bx[g] = 0.0; byy[g] = 0.0; }
+                        last = g;
+                        bw[g] += w;
+                        bx[g] += w * (x + (sx + 0.5) * inv_s);
+                        byy[g] += w * (y + (sy + 0.5) * inv_s);
+                        int e = -1;
+                        for (int k2 = 0; k2 < np; k2++) if (pg[k2] == g) { e = k2; break; }
+                        if (e < 0) { e = np++; pg[e] = g; pw[e] = 0.0; }
+                        pw[e] += w;
+                    }
+                }
+            }
+            pxn[npix] = np; pxmiss[npix] = miss;
+            for (int k3 = 0; k3 < np; k3++) { pxg[npix * 16 + k3] = pg[k3]; pxw[npix * 16 + k3] = pw[k3]; }
+            npix++; ne_total += np;
+        }
+    }
+    uint g0, e0;
+    InterlockedAdd(_Counters[0], uint(nb), g0);
+    InterlockedAdd(_Counters[1], uint(ne_total), e0);
+    for (int g = 0; g < nb; g++) {
+        float px = bx[g] / bw[g], py = byy[g] / bw[g];
+        float xc = (px - _Cx) / _Fx, yc = -(py - _Cy) / _Fy;
+        float3 d = normalize(_CamRight * xc + _CamUp * yc + _CamFwd);
+        uint gi = g0 + uint(g);
+        _GTri[gi] = bid[g];
+        _GDir[gi * 3u] = d.x; _GDir[gi * 3u + 1u] = d.y; _GDir[gi * 3u + 2u] = d.z;
+    }
+    int p = 0; uint e = e0;
+    for (int y2 = by * R; y2 < y_end; y2++) {
+        for (int x2 = bxi * R; x2 < x_end; x2++) {
+            int np = pxn[p];
+            for (int k4 = 0; k4 < np; k4++) { _EGroup[e + uint(k4)] = int(g0) + pxg[p * 16 + k4]; _EW[e + uint(k4)] = pxw[p * 16 + k4]; }
+            _PxRef[y2 * _W + x2] = int((e << 5) | uint(np));
+            _PxMiss[y2 * _W + x2] = pxmiss[p];
+            e += uint(np); p++;
+        }
+    }
+}
+
+[numthreads(1, 1, 1)]
+void Args(uint3 id : SV_DispatchThreadID) { int left = clamp(int(_Counters[0]) - _Offset, 0, _Chunk); uint g = uint((left + _Group - 1) / _Group); if (_ArgsX > 0) { _Args[0] = uint(_ArgsX); _Args[1] = g; } else { _Args[0] = g; _Args[1] = 1u; } _Args[2] = 1u; }

@@ -8,3 +8,6 @@ scenes/*.neuron/
 # videos: attached to the GitHub release instead; rebuild with the scripts in demo/
 demo/*.mp4
 *.dylib
+
+# portable packs for the Unity runtime: `neuron-render export`
+scenes/*.nrpack/

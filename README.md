@@ -174,6 +174,34 @@ held-out scene camera, 41.9 dB on five withheld frames and 37.4 dB on withheld f
 and materials changed, against 56 dB for Blender's own render of this simple scene; its 40 frames take
 Blender 1 min 23 s (35 s on the GPU) and the network 0.59 s (`demo/ripple_parametric.mp4`).
 
+## In a game engine (Unity)
+
+A fitted scene can be carried into Unity and rendered there by the same network, from the Unity camera,
+with its frame, lights and materials as component properties. `unity/NeuronRender` is a Unity 6 project
+(built-in render pipeline); the kernels are the Metal ones ported to HLSL compute, the pack format is plain
+arrays plus JSON, so nothing of PyTorch or Metal is needed at runtime.
+
+```
+neuron-render export scenes/stage.blend --parametric -o scenes/stage.nrpack   # 247 MB of tables, pack.json
+# open unity/NeuronRender in Unity 6 (6000.x), open Assets/Scenes/NeuronDemo.unity, press Play
+```
+
+`NeuronRenderer` sits on a camera: point `packPath` at a pack, pick a preset, and the camera's image is the
+fitted scene. Lights (energy, colour, world strength) and editable materials (base colour, roughness)
+appear as lists in the inspector and can be driven from scripts; `frame` scrubs the animation.
+`NeuronDemoUI` adds an on-screen panel for all of that (Tab hides it, Space plays the animation). The scene
+coordinates are Blender's (Z up): a Unity position (x, y, z) is Blender (x, z, y).
+
+Checked against the Python renderer on the same frames, same inputs: the Unity port agrees to 57-61 dB on
+`stage` (reference frame, an animated frame, an edited state, and through the camera component) and 77 dB on
+`mori`; what remains is rasterizer edge rounding. It is slower than the Metal path for now: at 960x540,
+`balanced` costs about 130 ms a frame on the M5 (encode kernel ~70%, the MLP as a tiled matrix product ~25%),
+against 70 ms in Python. Headless checks: `Unity -batchmode -projectPath unity/NeuronRender -executeMethod
+NeuronRender.Editor.NeuronValidate.Run -quit -nrpack scenes/stage.nrpack -nrframe 0 -nrout /tmp/f.png`.
+
+What it is in an engine: a baked, relightable, repaintable scene that renders from any camera in its band.
+It does not light or shadow the engine's own objects, and it is still one fit per scene.
+
 ## What it is not
 
 - **Not a general renderer.** A fit belongs to one file. A plain fit freezes the scene and covers a band
@@ -212,8 +240,10 @@ neuron_render/plan.py        which views, frames and material states the teacher
 neuron_render/environment.py the world shader baked into an environment map
 neuron_render/fit.py         dataset, training, held-out scoring
 neuron_render/render.py      the renderer and the quality presets
+neuron_render/export.py      the portable pack a fitted scene is exported as
 scenes/                      the five .blend files, make_scenes.py, and the fitted bundles (<name>.neuron, <name>.parametric.neuron)
 demo/                        the videos and the scripts that build them
+unity/NeuronRender/          the Unity 6 runtime: HLSL compute ports of the kernels, NeuronRenderer, a demo scene
 ```
 
 ## License

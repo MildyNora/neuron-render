@@ -1,0 +1,89 @@
+// Per shading sample: the network input (analytic features + grid + triangle code), then the MLP.
+#pragma use_dxc
+#pragma kernel Encode
+#pragma kernel Gemm
+#include "NeuronCommon.hlsl"
+
+StructuredBuffer<uint> _Counters;      // [0] shading groups, [1] pixel entries
+StructuredBuffer<int> _GTri;
+StructuredBuffer<float> _GDir;
+RWStructuredBuffer<uint> _Feat;        // [n, DINP] halves, two per uint (DINP = DIN rounded up to even)
+RWStructuredBuffer<float> _Rad;        // [n, 3G] log-radiance
+StructuredBuffer<uint> _X; RWStructuredBuffer<uint> _Y; StructuredBuffer<uint> _Wm, _Bm;
+int _N, _K, _Kstride, _M, _Mstride, _Relu, _OutFloat, _RowOffset;
+StructuredBuffer<uint> _W0, _W1, _W2, _W3, _B0, _B1, _B2, _B3;   // halves
+float3 _Origin;
+int _Din, _Dinp, _Width, _Nout, _Offset, _Chunk;
+
+[numthreads(64, 1, 1)]
+void Encode(uint3 id : SV_DispatchThreadID) {
+    uint local = id.x, idx = local + uint(_Offset);
+    if (local >= uint(_Chunk) || idx >= _Counters[0]) return;
+    float tau = _Vt[0];
+    float3 d = ld3(_GDir, 3u * idx);
+    Surf s = nr_surface(_GTri[idx], _Origin, d, _Icfg[0]);
+    if (_Icfg[8] != 0) nr_canon(s, _Icfg[0]);
+    float f[MAX_FEAT];
+    for (int z = 0; z < MAX_FEAT; z++) f[z] = 0.0;
+    int L = _Icfg[2], F = _Icfg[3], FT = _Icfg[4];
+    int n = nr_dense(s, d, tau, f);
+    nr_hash(0, nr_grid_pos(s.xc), tau, L, F, f, n);
+    n += L * F;
+    for (int c = 0; c < FT; c++) f[n + c] = H16(_Emb, uint(_GTri[idx]) * uint(FT) + uint(c));
+    n += FT;
+    for (int i = n; i < _Dinp; i++) f[i] = 0.0;
+    uint base = local * uint(_Dinp) / 2u;
+    for (int p = 0; p < _Dinp; p += 2) _Feat[base + uint(p >> 1)] = f32tof16(f[p]) | (f32tof16(f[p + 1]) << 16);
+}
+
+
+// One layer of the MLP as a tiled matrix product: Y[n, M] = act(X[n, K] . W[M, K]^T + b). X and Y are rows of
+// packed halves (even strides), W and b halves. 64 x 64 output tiles, 16 x 16 threads, 4 x 4 outputs each.
+groupshared float As[64][17];
+groupshared float Bs[16][65];
+float Xh(uint r, int k) { uint i = r * uint(_Kstride) + uint(k); uint w = _X[i >> 1]; return f16tof32((i & 1u) != 0u ? (w >> 16) : (w & 0xffffu)); }
+
+[numthreads(16, 16, 1)]
+void Gemm(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    int live = min(max(int(_Counters[0]) - _Offset, 0), _Chunk);
+    int row0 = int(gid.y) * 64, col0 = int(gid.x) * 64;
+    if (row0 >= live) return;
+    float acc[4][4];
+    int i, j, kk;
+    for (i = 0; i < 4; i++) for (j = 0; j < 4; j++) acc[i][j] = 0.0;
+    int t = int(tid.y) * 16 + int(tid.x);
+    for (int k0 = 0; k0 < _K; k0 += 16) {
+        for (int e = t; e < 1024; e += 256) {
+            int r = e >> 4; kk = e & 15;
+            As[r][kk] = (row0 + r < live && k0 + kk < _K) ? Xh(uint(row0 + r), k0 + kk) : 0.0;
+            int c = e >> 4; int k2 = e & 15;
+            Bs[k2][c] = (col0 + c < _M && k0 + k2 < _K) ? H16(_Wm, uint((col0 + c) * _K + k0 + k2)) : 0.0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        for (kk = 0; kk < 16; kk++) {
+            float a0 = As[tid.y * 4][kk], a1 = As[tid.y * 4 + 1][kk], a2 = As[tid.y * 4 + 2][kk], a3 = As[tid.y * 4 + 3][kk];
+            for (j = 0; j < 4; j++) {
+                float b = Bs[kk][tid.x * 4 + j];
+                acc[0][j] += a0 * b; acc[1][j] += a1 * b; acc[2][j] += a2 * b; acc[3][j] += a3 * b;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    for (i = 0; i < 4; i++) {
+        int row = row0 + int(tid.y) * 4 + i;
+        if (row >= live) continue;
+        float v[4];
+        for (j = 0; j < 4; j++) {
+            int col = col0 + int(tid.x) * 4 + j;
+            float y = col < _M ? acc[i][j] + H16(_Bm, uint(col)) : 0.0;
+            v[j] = _Relu != 0 ? max(y, 0.0) : y;
+            if (_OutFloat != 0 && col < _M) _Rad[uint(_RowOffset + row) * uint(_M) + uint(col)] = y;
+        }
+        if (_OutFloat == 0) {
+            int col = col0 + int(tid.x) * 4;
+            uint o = (uint(row) * uint(_Mstride) + uint(col)) >> 1;
+            if (col < _M) _Y[o] = f32tof16(v[0]) | (f32tof16(v[1]) << 16);
+            if (col + 2 < _M) _Y[o + 1u] = f32tof16(v[2]) | (f32tof16(v[3]) << 16);
+        }
+    }
+}

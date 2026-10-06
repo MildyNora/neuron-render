@@ -1,0 +1,90 @@
+// Per frame: the triangle table for this frame from the reference pose, and a refit of the BVH's boxes.
+#pragma use_dxc
+#pragma kernel BuildFrame
+#pragma kernel RefitBvh
+
+#define TRI_STRIDE 24u
+
+StructuredBuffer<float> _TriRef;
+StructuredBuffer<int> _TriObject;
+StructuredBuffer<int> _ObjKind;        // 0 static, 1 rigid, 2 deform
+StructuredBuffer<float> _Affine;       // per object: 12 floats, x' = x @ A[0..2] + A[3]  (rows of 3)
+StructuredBuffer<float> _AffineN;      // per object: 9 floats, n' = n @ inv(A).T
+StructuredBuffer<int> _DeformOffset;   // per object: first row of its vertex tables (triangles), -1 if none
+StructuredBuffer<int> _DeformFirst;    // per object: its first triangle index
+StructuredBuffer<float> _DeformVerts;  // this frame: rows of 9 floats
+StructuredBuffer<float> _DeformNormals;
+RWStructuredBuffer<float> _Tri;
+RWStructuredBuffer<float> _Bvh;
+StructuredBuffer<int> _BvhOrder;
+StructuredBuffer<int> _BvhDepth;
+int _NumTris, _NumNodes, _Level;
+
+float3 xform(float3 p, uint b, StructuredBuffer<float> A) {
+    return float3(p.x * A[b] + p.y * A[b + 3u] + p.z * A[b + 6u], p.x * A[b + 1u] + p.y * A[b + 4u] + p.z * A[b + 7u], p.x * A[b + 2u] + p.y * A[b + 5u] + p.z * A[b + 8u]);
+}
+
+[numthreads(64, 1, 1)]
+void BuildFrame(uint3 id : SV_DispatchThreadID) {
+    int i = int(id.x);
+    if (i > _NumTris) return;
+    uint b = uint(i) * TRI_STRIDE;
+    if (i == _NumTris) { for (uint c = 0u; c < TRI_STRIDE; c++) _Tri[b + c] = _TriRef[b + c]; return; }   // the sky row
+    int k = _TriObject[i];
+    int kind = _ObjKind[k];
+    float3 v[3], cn[3];
+    for (int c = 0; c < 3; c++) {
+        v[c] = float3(_TriRef[b + 3u * c], _TriRef[b + 3u * c + 1u], _TriRef[b + 3u * c + 2u]);
+        cn[c] = float3(_TriRef[b + 9u + 3u * c], _TriRef[b + 9u + 3u * c + 1u], _TriRef[b + 9u + 3u * c + 2u]);
+    }
+    if (kind == 1) {
+        uint ab = uint(k) * 12u, nb = uint(k) * 9u;
+        float3 t = float3(_Affine[ab + 9u], _Affine[ab + 10u], _Affine[ab + 11u]);
+        for (int c = 0; c < 3; c++) { v[c] = xform(v[c], ab, _Affine) + t; cn[c] = normalize(xform(cn[c], nb, _AffineN)); }
+    } else if (kind == 2) {
+        uint row = uint(_DeformOffset[k] + (i - _DeformFirst[k])) * 9u;
+        for (int c = 0; c < 3; c++) {
+            v[c] = float3(_DeformVerts[row + 3u * c], _DeformVerts[row + 3u * c + 1u], _DeformVerts[row + 3u * c + 2u]);
+            cn[c] = float3(_DeformNormals[row + 3u * c], _DeformNormals[row + 3u * c + 1u], _DeformNormals[row + 3u * c + 2u]);
+        }
+    }
+    float3 n = cross(v[1] - v[0], v[2] - v[0]);
+    float ln = length(n);
+    float3 avg = (cn[0] + cn[1] + cn[2]) / 3.0;
+    n = ln > 1.0e-20 ? n / ln : avg;
+    if (dot(n, avg) < 0.0) n = -n;
+    for (int c = 0; c < 3; c++) {
+        _Tri[b + 3u * c] = v[c].x; _Tri[b + 3u * c + 1u] = v[c].y; _Tri[b + 3u * c + 2u] = v[c].z;
+        _Tri[b + 9u + 3u * c] = cn[c].x; _Tri[b + 9u + 3u * c + 1u] = cn[c].y; _Tri[b + 9u + 3u * c + 2u] = cn[c].z;
+    }
+    _Tri[b + 18u] = n.x; _Tri[b + 19u] = n.y; _Tri[b + 20u] = n.z;
+    _Tri[b + 21u] = dot(n, v[0]);
+    _Tri[b + 22u] = _TriRef[b + 22u];
+    _Tri[b + 23u] = _TriRef[b + 23u];
+}
+
+// One dispatch per depth, deepest first: leaves from their triangles, inner nodes from their children.
+[numthreads(64, 1, 1)]
+void RefitBvh(uint3 id : SV_DispatchThreadID) {
+    int i = int(id.x);
+    if (i >= _NumNodes || _BvhDepth[i] != _Level) return;
+    uint nb = uint(i) * 8u;
+    int a = int(_Bvh[nb + 3u]), c = int(_Bvh[nb + 7u]);
+    float3 lo = 1.0e30, hi = -1.0e30;
+    if (c > 0) {
+        for (int t = 0; t < c; t++) {
+            uint tb = uint(_BvhOrder[a + t]) * TRI_STRIDE;
+            for (uint k = 0u; k < 3u; k++) {
+                float3 p = float3(_Tri[tb + 3u * k], _Tri[tb + 3u * k + 1u], _Tri[tb + 3u * k + 2u]);
+                lo = min(lo, p); hi = max(hi, p);
+            }
+        }
+        lo -= 1.0e-5; hi += 1.0e-5;
+    } else {
+        uint l = uint(a) * 8u, r = uint(-c) * 8u;
+        lo = min(float3(_Bvh[l], _Bvh[l + 1u], _Bvh[l + 2u]), float3(_Bvh[r], _Bvh[r + 1u], _Bvh[r + 2u]));
+        hi = max(float3(_Bvh[l + 4u], _Bvh[l + 5u], _Bvh[l + 6u]), float3(_Bvh[r + 4u], _Bvh[r + 5u], _Bvh[r + 6u]));
+    }
+    _Bvh[nb] = lo.x; _Bvh[nb + 1u] = lo.y; _Bvh[nb + 2u] = lo.z;
+    _Bvh[nb + 4u] = hi.x; _Bvh[nb + 5u] = hi.y; _Bvh[nb + 6u] = hi.z;
+}
